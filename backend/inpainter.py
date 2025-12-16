@@ -78,6 +78,74 @@ class VideoInpainter:
         
         return True
     
+    def _mux_audio_to_video(self, video_no_audio: str, original_video: str, output_path: str) -> str:
+        """
+        Mux audio from original video into the processed video using FFmpeg.
+        
+        Args:
+            video_no_audio: Path to processed video (no audio)
+            original_video: Path to original video with audio
+            output_path: Final output path with audio
+            
+        Returns:
+            Path to output video with audio
+        """
+        print(f"[Inpainter] Muxing audio from original video...")
+        
+        try:
+            # Check if FFmpeg is available
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+            if result.returncode != 0:
+                print("[Inpainter] FFmpeg not found, output will have no audio")
+                shutil.copy(video_no_audio, output_path)
+                return output_path
+        except FileNotFoundError:
+            print("[Inpainter] FFmpeg not found, output will have no audio")
+            shutil.copy(video_no_audio, output_path)
+            return output_path
+        
+        # FFmpeg command to mux audio from original into new video
+        # -c:v copy = copy video stream without re-encoding
+        # -c:a aac = encode audio as AAC for compatibility
+        # -map 0:v:0 = use video from first input (processed)
+        # -map 1:a:0? = use audio from second input (original) if it exists
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_no_audio,      # Input 1: processed video (no audio)
+            '-i', original_video,       # Input 2: original video (has audio)
+            '-c:v', 'copy',             # Copy video stream
+            '-c:a', 'aac',              # Encode audio as AAC
+            '-b:a', '192k',             # Audio bitrate
+            '-map', '0:v:0',            # Video from first input
+            '-map', '1:a:0?',           # Audio from second input (optional)
+            '-shortest',                # Match shortest stream
+            output_path
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0 and Path(output_path).exists():
+                print(f"[Inpainter] Audio muxed successfully: {output_path}")
+                # Clean up the no-audio temp file
+                if Path(video_no_audio).exists() and video_no_audio != output_path:
+                    os.remove(video_no_audio)
+                return output_path
+            else:
+                print(f"[Inpainter] FFmpeg muxing failed: {result.stderr[:500]}")
+                # Fall back to video without audio
+                shutil.copy(video_no_audio, output_path)
+                return output_path
+                
+        except subprocess.TimeoutExpired:
+            print("[Inpainter] FFmpeg muxing timed out")
+            shutil.copy(video_no_audio, output_path)
+            return output_path
+        except Exception as e:
+            print(f"[Inpainter] Audio muxing error: {e}")
+            shutil.copy(video_no_audio, output_path)
+            return output_path
+    
     def inpaint_video(
         self,
         video_path: str,
@@ -400,12 +468,14 @@ class VideoInpainter:
                 # Clean up chunk temp files
                 shutil.rmtree(chunk_dir, ignore_errors=True)
             
-            # Assemble final video
+            # Assemble final video (without audio first)
             if progress_callback:
                 progress_callback(92, 100, "Assembling final video...")
             
+            # Write to temp file first, then mux audio
+            temp_video_path = str(temp_dir / "output_no_audio.mp4")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
             
             for idx, frame in enumerate(all_result_frames):
                 if frame is not None:
@@ -415,6 +485,12 @@ class VideoInpainter:
                     out.write(all_frames[idx])
             
             out.release()
+            
+            # Mux audio from original video
+            if progress_callback:
+                progress_callback(96, 100, "Adding audio...")
+            
+            self._mux_audio_to_video(temp_video_path, video_path, output_path)
             
             if progress_callback:
                 progress_callback(100, 100, "Complete!")
