@@ -1,0 +1,3 @@
+@echo off
+echo Starting WaterSlayer...
+.\venv\Scripts\python start.py %*

@@ -1,0 +1,27 @@
+# WaterSlayer - Python Dependencies
+# Watermark removal using YOLO detection + ProPainter inpainting
+
+# Core
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+
+# Video processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+
+# Image processing
+Pillow>=10.0.0
+scipy>=1.11.0
+
+# Utilities
+python-multipart>=0.0.6
+tqdm>=4.65.0
+
+# NOTE: PyTorch with CUDA must be installed separately using:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#
+# YOLO for detection:
+#   pip install ultralytics

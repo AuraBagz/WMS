@@ -1,0 +1,28 @@
+# WaterSlayer Data
+
+# Ignore everything in data directories except .gitkeep
+/input/*
+!/input/.gitkeep
+/output/*
+!/output/.gitkeep
+/models/*
+!/models/.gitkeep
+/temp/*
+!/temp/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Downloaded models
+*.pt
