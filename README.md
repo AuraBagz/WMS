@@ -10,6 +10,7 @@ A standalone, portable application that removes watermarks from videos using YOL
 
 - **🎯 YOLO Detection** - Uses models trained with AnnoStudio
 - **🎨 ProPainter Inpainting** - State-of-the-art video inpainting
+- **🔊 Audio Preservation** - Keeps original audio in output videos
 - **⚡ GPU Accelerated** - Optimized for NVIDIA RTX GPUs
 - **📦 Portable** - Standalone app, easy to install
 - **🌐 Web UI** - Modern, clean interface
@@ -28,6 +29,7 @@ This will:
 - Create a virtual environment
 - Install PyTorch with CUDA 12.4
 - Install all dependencies
+- Install FFmpeg for audio preservation
 
 ### 2. Import a Detection Model
 
@@ -87,7 +89,8 @@ WaterSlayer/
 2. **Detect Watermarks** - YOLO model finds watermark regions
 3. **Create Masks** - Generate binary masks from detections
 4. **Inpaint** - Remove watermarks using ProPainter or OpenCV
-5. **Export** - Save clean video
+5. **Mux Audio** - Add original audio back using FFmpeg
+6. **Export** - Save clean video with audio
 
 ---
 
@@ -115,6 +118,7 @@ WaterSlayer/
 - **Python**: 3.10+
 - **GPU**: NVIDIA RTX (recommended for fast processing)
 - **VRAM**: 4GB+ recommended
+- **FFmpeg**: Required for audio preservation (auto-installed)
 
 ---
 
