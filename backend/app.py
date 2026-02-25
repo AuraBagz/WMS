@@ -95,17 +95,24 @@ app.add_middleware(
 
 @app.get("/api/videos")
 async def list_videos():
-    """List all input videos."""
+    """List all input videos recursively under data/input."""
     videos = []
-    
-    for ext in ['*.mp4', '*.mov', '*.avi', '*.mkv', '*.webm']:
-        for f in INPUT_DIR.glob(ext):
-            videos.append({
-                "name": f.stem,
-                "filename": f.name,
-                "path": str(f),
-                "size": f.stat().st_size
-            })
+    allowed_ext = {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
+
+    for f in INPUT_DIR.rglob("*"):
+        if not f.is_file() or f.suffix.lower() not in allowed_ext:
+            continue
+
+        rel = f.relative_to(INPUT_DIR)
+        folder = "" if rel.parent == Path(".") else rel.parent.as_posix()
+        display_name = f"{folder}/{f.stem}" if folder else f.stem
+
+        videos.append({
+            "name": display_name,
+            "filename": rel.as_posix(),
+            "path": str(f),
+            "size": f.stat().st_size
+        })
     
     # Sort by name
     videos.sort(key=lambda x: x["name"].lower())
