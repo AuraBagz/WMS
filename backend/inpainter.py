@@ -242,11 +242,12 @@ class VideoInpainter:
             '-pix_fmt', 'yuv420p',
         ]
 
+        # Always use CRF for quality-based encoding.
+        # Bitrate matching can degrade quality on re-encode (decode→process→encode
+        # generation loss), especially on lower-bitrate source files.
         if input_bitrate:
-            cmd += ['-b:v', str(input_bitrate), '-maxrate', str(int(input_bitrate * 1.5)), '-bufsize', str(int(input_bitrate * 2))]
-        else:
-            print("[Inpainter] Could not probe input bitrate, using CRF 16 (visually lossless)")
-            cmd += ['-crf', '16']
+            print(f"[Inpainter] Source bitrate {input_bitrate // 1000} kbps noted; using CRF 10 for quality preservation")
+        cmd += ['-crf', '10']
 
         cmd.append(output_path)
 
@@ -868,8 +869,17 @@ class VideoInpainter:
                             result_video = alt
                             break
                 
-                if result_video.exists():
-                    # Extract frames from the result video
+                # Prefer lossless PNG frames over the lossy inpaint_out.mp4
+                frames_png_dir = chunk_output_dir / frames_dir_name / "frames"
+                png_files = sorted(frames_png_dir.glob("*.png")) if frames_png_dir.exists() else []
+
+                if png_files:
+                    # Read lossless PNGs — no intermediate lossy encode
+                    result_frames = [cv2.imread(str(p)) for p in png_files]
+                    result_frames = [f for f in result_frames if f is not None]
+                    print(f"[Inpainter] Read {len(result_frames)} lossless PNG frames from ProPainter output")
+                elif result_video.exists():
+                    # Fallback: extract frames from the compressed video
                     result_cap = cv2.VideoCapture(str(result_video))
                     result_frames = []
                     while True:
@@ -878,28 +888,35 @@ class VideoInpainter:
                             break
                         result_frames.append(frame)
                     result_cap.release()
-                    
-                    print(f"[Inpainter] Extracted {len(result_frames)} frames from ProPainter output")
-                    
+                    print(f"[Inpainter] Extracted {len(result_frames)} frames from ProPainter video (lossy fallback)")
+                else:
+                    result_frames = []
+                    print(f"[Inpainter] ERROR: ProPainter output not found!")
+                    print(f"[Inpainter] Searched: {result_video}")
+                    if chunk_output_dir.exists():
+                        print(f"[Inpainter] Contents of {chunk_output_dir}:")
+                        for item in chunk_output_dir.rglob("*"):
+                            print(f"  - {item}")
+
+                if result_frames:
                     if len(result_frames) != len(chunk_frames):
                         print(f"[Inpainter] Warning: Expected {len(chunk_frames)} results, got {len(result_frames)}")
-                    
+
                     # Store results with overlap blending
                     for local_idx, global_idx in enumerate(chunk_frames):
                         if local_idx < len(result_frames):
                             result_frame = result_frames[local_idx]
-                            
+
                             # Resize back to original if needed
                             if result_frame.shape[:2] != (height, width):
-                                result_frame = cv2.resize(result_frame, (width, height), 
+                                result_frame = cv2.resize(result_frame, (width, height),
                                                          interpolation=cv2.INTER_LANCZOS4)
-                            
+
                             # Handle overlap blending
                             if all_result_frames[global_idx] is not None:
-                                # This frame is in overlap zone - blend with previous chunk
-                                overlap_position = local_idx  # How far into current chunk
+                                overlap_position = local_idx
                                 blend_alpha = overlap_position / overlap
-                                
+
                                 prev_frame = all_result_frames[global_idx]
                                 blended = cv2.addWeighted(
                                     prev_frame, 1 - blend_alpha,
@@ -909,14 +926,6 @@ class VideoInpainter:
                                 all_result_frames[global_idx] = blended
                             else:
                                 all_result_frames[global_idx] = result_frame
-                else:
-                    print(f"[Inpainter] ERROR: ProPainter output not found!")
-                    print(f"[Inpainter] Searched: {result_video}")
-                    # List contents for debugging
-                    if chunk_output_dir.exists():
-                        print(f"[Inpainter] Contents of {chunk_output_dir}:")
-                        for item in chunk_output_dir.rglob("*"):
-                            print(f"  - {item}")
                 
                 # Clean up chunk temp files
                 shutil.rmtree(chunk_dir, ignore_errors=True)
@@ -1010,7 +1019,8 @@ class VideoInpainter:
             "--raft_iter", str(raft_iter),
             "--mask_dilation", str(mask_dilation),
             "--subvideo_length", str(subvideo_length),
-            "--save_fps", str(max(1, int(round(fps))))
+            "--save_fps", str(max(1, int(round(fps)))),
+            "--save_frames",  # Save lossless PNGs to avoid lossy intermediate video
         ]
 
         if use_fp16:

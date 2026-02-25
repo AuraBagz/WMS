@@ -1,3 +1,3 @@
 @echo off
 echo Starting WaterSlayer...
-.\venv\Scripts\python start.py %*
+.\venv\Scripts\python start.py --port 5400 %*
