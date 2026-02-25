@@ -127,11 +127,25 @@
 
                         <!-- Or select from input folder -->
                         <div class="divider">
-                            <span>or select from input folder</span>
+                            <span>or select from server folders</span>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Server Source</label>
+                            <select id="video-source-select" class="select">
+                                <option value="input">Input Folder (data/input)</option>
+                                <option value="output">Output Folder (data/output)</option>
+                                <option value="all">Input + Output</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Subfolder (optional)</label>
+                            <input id="video-subdir-input" class="select" type="text" placeholder="Example: Watermark_Clips_20260225">
                         </div>
 
                         <select id="video-select" class="select">
-                            <option value="">Select from data/input/...</option>
+                            <option value="">Select from server...</option>
                         </select>
 
                         <button class="btn btn-ghost btn-sm" id="refresh-videos-btn" style="margin-top: 8px;">

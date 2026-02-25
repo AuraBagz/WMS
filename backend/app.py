@@ -94,25 +94,55 @@ app.add_middleware(
 # ============================================
 
 @app.get("/api/videos")
-async def list_videos():
-    """List all input videos recursively under data/input."""
+async def list_videos(
+    source: str = Query("input"),
+    subdir: str = Query("")
+):
+    """List videos from input/output folders (recursive, with optional subdir)."""
     videos = []
     allowed_ext = {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
+    source_key = (source or "input").lower()
 
-    for f in INPUT_DIR.rglob("*"):
-        if not f.is_file() or f.suffix.lower() not in allowed_ext:
+    source_dirs = []
+    if source_key == "input":
+        source_dirs = [("input", INPUT_DIR)]
+    elif source_key == "output":
+        source_dirs = [("output", OUTPUT_DIR)]
+    elif source_key in {"all", "both"}:
+        source_dirs = [("input", INPUT_DIR), ("output", OUTPUT_DIR)]
+    else:
+        raise HTTPException(400, "source must be one of: input, output, all")
+
+    subdir_path = Path(subdir.strip()) if subdir else Path(".")
+
+    for source_name, base_dir in source_dirs:
+        try:
+            start_dir = (base_dir / subdir_path).resolve()
+            base_resolved = base_dir.resolve()
+        except Exception:
             continue
 
-        rel = f.relative_to(INPUT_DIR)
-        folder = "" if rel.parent == Path(".") else rel.parent.as_posix()
-        display_name = f"{folder}/{f.stem}" if folder else f.stem
+        # Prevent path escape outside the configured source directory
+        if not str(start_dir).startswith(str(base_resolved)):
+            continue
+        if not start_dir.exists() or not start_dir.is_dir():
+            continue
 
-        videos.append({
-            "name": display_name,
-            "filename": rel.as_posix(),
-            "path": str(f),
-            "size": f.stat().st_size
-        })
+        for f in start_dir.rglob("*"):
+            if not f.is_file() or f.suffix.lower() not in allowed_ext:
+                continue
+
+            rel = f.relative_to(base_dir)
+            folder = "" if rel.parent == Path(".") else rel.parent.as_posix()
+            display_name = f"{source_name}/{folder}/{f.stem}" if folder else f"{source_name}/{f.stem}"
+
+            videos.append({
+                "name": display_name,
+                "filename": rel.as_posix(),
+                "path": str(f),
+                "size": f.stat().st_size,
+                "source": source_name
+            })
     
     # Sort by name
     videos.sort(key=lambda x: x["name"].lower())

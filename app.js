@@ -58,8 +58,12 @@ const api = {
     },
 
     // Videos
-    async getVideos() {
-        return this.request('/api/videos');
+    async getVideos(source = 'input', subdir = '') {
+        const q = new URLSearchParams({
+            source: source || 'input',
+            subdir: subdir || ''
+        });
+        return this.request(`/api/videos?${q.toString()}`);
     },
 
     // Processing
@@ -347,7 +351,9 @@ async function loadModels() {
 
 async function loadVideos() {
     try {
-        const data = await api.getVideos();
+        const source = $('#video-source-select')?.value || 'input';
+        const subdir = $('#video-subdir-input')?.value?.trim() || '';
+        const data = await api.getVideos(source, subdir);
         ui.populateVideos(data.videos || []);
     } catch (error) {
         console.error('Failed to load videos:', error);
@@ -635,6 +641,17 @@ function setupEventListeners() {
         state.manualBox = null;
         $('#box-coords').classList.add('hidden');
         ui.updateProcessButton();
+    });
+
+    // Video source filters
+    $('#video-source-select').addEventListener('change', () => {
+        loadVideos();
+    });
+    $('#video-subdir-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            loadVideos();
+        }
     });
 
     // Browse video button
