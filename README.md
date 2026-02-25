@@ -100,6 +100,7 @@ WaterSlayer/
 |---------|-------------|
 | **Detection Confidence** | Higher = fewer false positives, but might miss subtle watermarks |
 | **Inpainting Method** | `auto` uses best available, `opencv` is fast, `propainter` is high-quality |
+| **Quality Profile** | `auto` detects GPU profile, `balanced` is default, `rtx5090` uses larger temporal windows for max quality |
 
 ---
 

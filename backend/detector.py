@@ -229,6 +229,7 @@ class WatermarkDetector:
         self,
         video_path: str,
         conf_threshold: float = 0.5,
+        expand_ratio: float = 0.1,
         sample_rate: int = 1,
         progress_callback=None
     ) -> Dict[int, List[Dict]]:
@@ -238,6 +239,7 @@ class WatermarkDetector:
         Args:
             video_path: Path to video file
             conf_threshold: Confidence threshold
+            expand_ratio: Expand detected boxes for inpainting coverage
             sample_rate: Process every Nth frame (interpolate rest)
             progress_callback: Called with (current_frame, total_frames)
             
@@ -256,7 +258,7 @@ class WatermarkDetector:
                 break
             
             if frame_idx % sample_rate == 0:
-                detections = self.detect(frame, conf_threshold)
+                detections = self.detect(frame, conf_threshold, expand_ratio=expand_ratio)
                 detections_by_frame[frame_idx] = detections
             
             if progress_callback:
@@ -271,6 +273,91 @@ class WatermarkDetector:
             self._interpolate_detections(detections_by_frame, total_frames, sample_rate)
         
         return detections_by_frame
+
+    def smooth_video_detections(
+        self,
+        detections_by_frame: Dict[int, List[Dict]],
+        total_frames: int,
+        alpha: float = 0.7,
+        max_shift_ratio: float = 0.35,
+        hold_frames: int = 2
+    ) -> Dict[int, List[Dict]]:
+        """
+        Smooth per-frame detections to reduce temporal mask jitter.
+
+        Args:
+            detections_by_frame: Raw detections indexed by frame number
+            total_frames: Total number of frames in the video
+            alpha: Smoothing factor (higher = follow new detection more)
+            max_shift_ratio: Clamp center shifts relative to prior box size
+            hold_frames: Keep last known box for short misses
+
+        Returns:
+            Smoothed detections indexed by frame number
+        """
+        smoothed: Dict[int, List[Dict]] = {}
+        prev_smoothed: List[Dict] = []
+        missing_streak = 0
+
+        for frame_idx in range(total_frames):
+            current = detections_by_frame.get(frame_idx, [])
+
+            if not current and prev_smoothed and missing_streak < hold_frames:
+                # Hold previous detections briefly to prevent mask flicker.
+                smoothed[frame_idx] = [dict(d) for d in prev_smoothed]
+                missing_streak += 1
+                continue
+
+            missing_streak = 0 if current else missing_streak + 1
+            if not current:
+                smoothed[frame_idx] = []
+                prev_smoothed = []
+                continue
+
+            # Stable pairing: sort boxes spatially and blend by index.
+            curr_sorted = sorted(current, key=lambda d: (d['x'], d['y']))
+            prev_sorted = sorted(prev_smoothed, key=lambda d: (d['x'], d['y']))
+
+            blended: List[Dict] = []
+            for i, det in enumerate(curr_sorted):
+                if i < len(prev_sorted):
+                    p = prev_sorted[i]
+
+                    cx = det['x'] + det['width'] / 2.0
+                    cy = det['y'] + det['height'] / 2.0
+                    pcx = p['x'] + p['width'] / 2.0
+                    pcy = p['y'] + p['height'] / 2.0
+
+                    max_dx = max(det['width'], p['width']) * max_shift_ratio
+                    max_dy = max(det['height'], p['height']) * max_shift_ratio
+
+                    clamped_cx = np.clip(cx, pcx - max_dx, pcx + max_dx)
+                    clamped_cy = np.clip(cy, pcy - max_dy, pcy + max_dy)
+
+                    smooth_cx = alpha * clamped_cx + (1.0 - alpha) * pcx
+                    smooth_cy = alpha * clamped_cy + (1.0 - alpha) * pcy
+                    smooth_w = alpha * det['width'] + (1.0 - alpha) * p['width']
+                    smooth_h = alpha * det['height'] + (1.0 - alpha) * p['height']
+
+                    smooth_w = max(1, int(round(smooth_w)))
+                    smooth_h = max(1, int(round(smooth_h)))
+                    smooth_x = int(round(smooth_cx - smooth_w / 2.0))
+                    smooth_y = int(round(smooth_cy - smooth_h / 2.0))
+
+                    blended.append({
+                        'x': smooth_x,
+                        'y': smooth_y,
+                        'width': smooth_w,
+                        'height': smooth_h,
+                        'confidence': max(det.get('confidence', 0.0), p.get('confidence', 0.0))
+                    })
+                else:
+                    blended.append(dict(det))
+
+            smoothed[frame_idx] = blended
+            prev_smoothed = blended
+
+        return smoothed
     
     def _interpolate_detections(
         self, 

@@ -27,7 +27,11 @@ echo [2/6] Upgrading pip...
 echo.
 echo [3/6] Installing PyTorch with CUDA 12.4 support...
 echo      (This may take a few minutes for the ~2.5GB download)
-.\venv\Scripts\pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+echo Removing any old Torch installs (prevents mixed wheels)...
+.\venv\Scripts\pip cache purge
+.\venv\Scripts\pip uninstall -y torch torchvision torchaudio >nul 2>&1
+.\venv\Scripts\pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
 
 echo.
 echo [4/6] Installing Ultralytics YOLO...
@@ -88,7 +92,8 @@ echo.
 echo To start WaterSlayer, run: START.bat
 echo.
 echo Verifying installation...
-.\venv\Scripts\python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}')"
+.\venv\Scripts\python -c "import torch; print('PyTorch:', torch.__version__); print('Torch CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0)); print('CC:', torch.cuda.get_device_capability(0)); x=torch.randn(1, device='cuda'); print('CUDA kernel test: OK')"
+
 echo.
 
 REM Check FFmpeg again

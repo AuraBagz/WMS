@@ -10,10 +10,12 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
+import cv2
+
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 from .processor import VideoProcessor, JobStatus
@@ -40,11 +42,24 @@ processor = VideoProcessor(OUTPUT_DIR)
 # Pydantic Models
 # ============================================
 
+class ManualBox(BaseModel):
+    x: int
+    y: int
+    width: int
+    height: int
+
+
 class ProcessRequest(BaseModel):
     video_path: str
-    model_path: str
+    model_path: str = ''
     conf_threshold: float = 0.5
+    high_threshold: Optional[float] = None
+    low_threshold: Optional[float] = None
+    detection_mode: str = 'standard'
+    detail_restore_mode: str = 'off'
     inpaint_method: str = 'auto'
+    quality_mode: str = 'auto'
+    manual_box: Optional[ManualBox] = None
 
 
 class ModelInfo(BaseModel):
@@ -70,6 +85,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Video-Width", "X-Video-Height", "X-Total-Frames"],
 )
 
 
@@ -113,6 +129,43 @@ async def upload_video(file: UploadFile = File(...)):
         "path": str(dest),
         "size": dest.stat().st_size
     }
+
+
+# ============================================
+# Frame Preview Endpoint
+# ============================================
+
+@app.get("/api/videos/frame")
+async def get_video_frame(path: str = Query(...), frame: int = Query(0)):
+    """Extract a single frame from a video as JPEG for preview."""
+    video_path = Path(path)
+    if not video_path.exists():
+        raise HTTPException(404, f"Video not found: {path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(400, "Could not open video")
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
+    ret, img = cap.read()
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    if not ret:
+        raise HTTPException(400, "Could not read frame")
+
+    _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return Response(
+        content=buf.tobytes(),
+        media_type="image/jpeg",
+        headers={
+            "X-Video-Width": str(w),
+            "X-Video-Height": str(h),
+            "X-Total-Frames": str(total)
+        }
+    )
 
 
 # ============================================
@@ -233,28 +286,45 @@ async def start_processing(request: ProcessRequest):
     video_path = Path(request.video_path)
     if not video_path.exists():
         raise HTTPException(404, f"Video not found: {request.video_path}")
-    
-    model_path = Path(request.model_path)
-    if not model_path.exists():
-        raise HTTPException(404, f"Model not found: {request.model_path}")
-    
+
+    # Manual box mode: model is optional
+    manual_box_dict = None
+    if request.manual_box:
+        manual_box_dict = {
+            'x': request.manual_box.x,
+            'y': request.manual_box.y,
+            'width': request.manual_box.width,
+            'height': request.manual_box.height,
+        }
+    else:
+        model_path = Path(request.model_path)
+        if not model_path.exists():
+            raise HTTPException(404, f"Model not found: {request.model_path}")
+
     # Create job
-    job = processor.create_job(str(video_path), str(model_path))
-    
+    job = processor.create_job(str(video_path), request.model_path or "")
+
     # Start processing in background thread
     def run_processing():
         try:
+            high_threshold = request.high_threshold if request.high_threshold is not None else request.conf_threshold
+            low_threshold = request.low_threshold if request.low_threshold is not None else 0.2
             processor.process_video(
                 job,
-                conf_threshold=request.conf_threshold,
-                inpaint_method=request.inpaint_method
+                conf_threshold=high_threshold,
+                low_threshold=low_threshold,
+                detection_mode=request.detection_mode,
+                detail_restore_mode=request.detail_restore_mode,
+                inpaint_method=request.inpaint_method,
+                quality_mode=request.quality_mode,
+                manual_box=manual_box_dict
             )
         except Exception as e:
             print(f"Processing failed: {e}")
-    
+
     thread = threading.Thread(target=run_processing, daemon=True)
     thread.start()
-    
+
     return {
         "success": True,
         "job_id": job.job_id,

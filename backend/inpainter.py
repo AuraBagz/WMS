@@ -14,6 +14,7 @@ from typing import List, Dict, Optional, Callable
 import subprocess
 import tempfile
 import shutil
+import threading
 
 
 # Add ProPainter to path
@@ -22,28 +23,82 @@ if PROPAINTER_DIR.exists():
     sys.path.insert(0, str(PROPAINTER_DIR))
 
 
+class _FFmpegWriter:
+    """Streaming FFmpeg writer with background stderr drain to prevent deadlock."""
+
+    def __init__(self, proc, stderr_thread, stderr_lines, output_path):
+        self._proc = proc
+        self._stderr_thread = stderr_thread
+        self._stderr_lines = stderr_lines
+        self._output_path = output_path
+        self._closed = False
+
+    def write_frame(self, frame):
+        if frame is not None and not self._closed:
+            try:
+                self._proc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                self._closed = True
+
+    def close(self):
+        if self._closed and self._proc.poll() is None:
+            self._proc.kill()
+        else:
+            try:
+                self._proc.stdin.close()
+            except Exception:
+                pass
+            self._proc.wait()
+        self._stderr_thread.join(timeout=5)
+
+        if self._proc.returncode != 0:
+            stderr = b''.join(self._stderr_lines).decode(errors='replace')
+            print(f"[Inpainter] FFmpeg encoding failed (rc={self._proc.returncode}): {stderr[:500]}")
+            raise RuntimeError(f"FFmpeg failed: {stderr[:200]}")
+        else:
+            print(f"[Inpainter] FFmpeg encoding complete: {self._output_path}")
+
+
+class _OpenCVWriter:
+    """OpenCV VideoWriter with same interface as _FFmpegWriter."""
+
+    def __init__(self, writer):
+        self._writer = writer
+
+    def write_frame(self, frame):
+        if frame is not None:
+            self._writer.write(frame)
+
+    def close(self):
+        self._writer.release()
+
+
 class VideoInpainter:
     """
     Video inpainting using ProPainter or fallback methods.
-    
+
     ProPainter provides state-of-the-art video inpainting with
     temporal consistency.
     """
-    
+
     def __init__(self, propainter_path: str = None):
         """
         Initialize inpainter.
-        
+
         Args:
             propainter_path: Path to ProPainter installation (optional)
         """
         self.propainter_path = propainter_path or str(PROPAINTER_DIR)
         self.device = 'cuda' if self._check_cuda() else 'cpu'
+        self.gpu_name = self._get_gpu_name()
         self.propainter_available = self._check_propainter()
-        
+        self._ffmpeg_exe = self._resolve_ffmpeg_exe()
+
         print(f"[Inpainter] Device: {self.device}")
+        print(f"[Inpainter] GPU: {self.gpu_name}")
         print(f"[Inpainter] ProPainter path: {self.propainter_path}")
         print(f"[Inpainter] ProPainter available: {self.propainter_available}")
+        print(f"[Inpainter] FFmpeg available: {self._ffmpeg_exe is not None}")
     
     def _check_cuda(self) -> bool:
         """Check if CUDA is available."""
@@ -52,6 +107,236 @@ class VideoInpainter:
             return torch.cuda.is_available()
         except:
             return False
+
+    def _get_gpu_name(self) -> str:
+        """Get the active GPU name."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+        return "CPU"
+
+    def _is_rtx_5090(self) -> bool:
+        return "5090" in self.gpu_name.lower()
+
+    @staticmethod
+    def _resolve_ffmpeg_exe() -> Optional[str]:
+        """Find FFmpeg executable from system PATH or imageio-ffmpeg."""
+        exe = shutil.which("ffmpeg")
+        if exe:
+            return exe
+        try:
+            import imageio_ffmpeg  # type: ignore
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _resolve_ffprobe_exe() -> Optional[str]:
+        """Find ffprobe executable from system PATH or derive from imageio-ffmpeg."""
+        exe = shutil.which("ffprobe")
+        if exe:
+            return exe
+        # Try to derive from ffmpeg path (ffprobe is usually next to ffmpeg)
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            ffprobe_path = Path(ffmpeg).parent / ("ffprobe" + Path(ffmpeg).suffix)
+            if ffprobe_path.exists():
+                return str(ffprobe_path)
+        try:
+            import imageio_ffmpeg  # type: ignore
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            ffprobe_path = Path(ffmpeg_path).parent / ("ffprobe" + Path(ffmpeg_path).suffix)
+            if ffprobe_path.exists():
+                return str(ffprobe_path)
+        except Exception:
+            pass
+        return None
+
+    def _probe_video_bitrate(self, video_path: str) -> Optional[int]:
+        """
+        Get video stream bitrate in bits/s from input video using ffprobe.
+
+        Returns bitrate as int, or None if unavailable.
+        """
+        ffprobe_exe = self._resolve_ffprobe_exe()
+        if not ffprobe_exe:
+            return None
+        try:
+            cmd = [
+                ffprobe_exe, '-v', 'quiet',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=bit_rate',
+                '-of', 'csv=p=0',
+                video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                val = result.stdout.strip().split('\n')[0].strip()
+                if val and val != 'N/A':
+                    return int(val)
+        except Exception as e:
+            print(f"[Inpainter] ffprobe bitrate query failed: {e}")
+
+        # Fallback: try format-level bit_rate (total stream) and subtract audio estimate
+        try:
+            cmd = [
+                ffprobe_exe, '-v', 'quiet',
+                '-show_entries', 'format=bit_rate',
+                '-of', 'csv=p=0',
+                video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                val = result.stdout.strip().split('\n')[0].strip()
+                if val and val != 'N/A':
+                    # Subtract ~192k for audio as rough estimate
+                    return max(500_000, int(val) - 192_000)
+        except Exception as e:
+            print(f"[Inpainter] ffprobe format bitrate query failed: {e}")
+
+        return None
+
+    def _open_video_writer(
+        self,
+        output_path: str,
+        fps: float,
+        width: int,
+        height: int,
+        source_video_path: str = None
+    ):
+        """
+        Open a streaming FFmpeg video writer. Returns a context object with
+        .write_frame(frame) and .close() methods.
+
+        Uses H.264 with bitrate matching (probed from source) or CRF 16 fallback.
+        Falls back to OpenCV VideoWriter if FFmpeg is unavailable.
+        """
+        ffmpeg_exe = self._ffmpeg_exe
+        if not ffmpeg_exe:
+            print("[Inpainter] FFmpeg not available, falling back to OpenCV VideoWriter")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            return _OpenCVWriter(out)
+
+        # Probe input bitrate to match output quality
+        input_bitrate = None
+        if source_video_path:
+            input_bitrate = self._probe_video_bitrate(source_video_path)
+            if input_bitrate:
+                print(f"[Inpainter] Input video bitrate: {input_bitrate // 1000} kbps — matching on output")
+
+        cmd = [
+            ffmpeg_exe, '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}',
+            '-pix_fmt', 'bgr24',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-pix_fmt', 'yuv420p',
+        ]
+
+        if input_bitrate:
+            cmd += ['-b:v', str(input_bitrate), '-maxrate', str(int(input_bitrate * 1.5)), '-bufsize', str(int(input_bitrate * 2))]
+        else:
+            print("[Inpainter] Could not probe input bitrate, using CRF 16 (visually lossless)")
+            cmd += ['-crf', '16']
+
+        cmd.append(output_path)
+
+        print(f"[Inpainter] Opening FFmpeg H.264 encoder (streaming)...")
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Drain stderr in background thread to prevent pipe deadlock
+        stderr_lines = []
+        def _drain_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        return _FFmpegWriter(proc, stderr_thread, stderr_lines, output_path)
+
+    def _write_frames_to_video(
+        self,
+        frames,
+        output_path: str,
+        fps: float,
+        width: int,
+        height: int,
+        source_video_path: str = None
+    ):
+        """Write a list of frames to video. Convenience wrapper around _open_video_writer."""
+        writer = self._open_video_writer(output_path, fps, width, height, source_video_path)
+        try:
+            for frame in frames:
+                writer.write_frame(frame)
+        finally:
+            writer.close()
+
+    def _resolve_quality_mode(self, quality_mode: str) -> str:
+        if quality_mode == 'auto':
+            return 'rtx5090' if self._is_rtx_5090() else 'balanced'
+        return quality_mode
+
+    def _quality_profile(self, quality_mode: str) -> dict:
+        mode = self._resolve_quality_mode(quality_mode)
+
+        if mode == 'rtx5090':
+            return {
+                "name": "RTX 5090 Maximum Quality (ProPainter-aligned)",
+                "chunk_size": 64,
+                "overlap": 12,
+                "neighbor_length": 10,
+                "ref_stride": 10,
+                "raft_iter": 20,
+                "mask_dilation": 4,
+                "subvideo_length": 64,
+                "use_fp16": True
+            }
+
+        if mode == 'rtx5090_crisp':
+            return {
+                "name": "RTX 5090 Crisp (Tight Mask)",
+                "chunk_size": 56,
+                "overlap": 10,
+                "neighbor_length": 8,
+                "ref_stride": 10,
+                "raft_iter": 20,
+                "mask_dilation": 2,
+                "subvideo_length": 48,
+                "use_fp16": True
+            }
+
+        return {
+            "name": "Balanced",
+            "chunk_size": 40,
+            "overlap": 10,
+            "neighbor_length": 10,
+            "ref_stride": 10,
+            "raft_iter": 20,
+            "mask_dilation": 4,
+            "subvideo_length": 40,
+            "use_fp16": True
+        }
+
+    def _is_memory_error(self, message: str) -> bool:
+        text = (message or "").lower()
+        patterns = [
+            "out of memory",
+            "outofmemoryerror",
+            "cuda out of memory",
+            "host_allocation_failed",
+            "cudnn_status_internal_error_host_allocation_failed",
+            "cuda error: out of memory",
+        ]
+        return any(p in text for p in patterns)
     
     def _check_propainter(self) -> bool:
         """Check if ProPainter is available."""
@@ -81,62 +366,79 @@ class VideoInpainter:
     def _mux_audio_to_video(self, video_no_audio: str, original_video: str, output_path: str) -> str:
         """
         Mux audio from original video into the processed video using FFmpeg.
-        
+
+        Tries stream-copying audio first (zero quality loss), falls back to
+        AAC re-encoding if the container doesn't support the original codec.
+
         Args:
             video_no_audio: Path to processed video (no audio)
             original_video: Path to original video with audio
             output_path: Final output path with audio
-            
+
         Returns:
             Path to output video with audio
         """
         print(f"[Inpainter] Muxing audio from original video...")
-        
-        try:
-            # Check if FFmpeg is available
-            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
-            if result.returncode != 0:
-                print("[Inpainter] FFmpeg not found, output will have no audio")
-                shutil.copy(video_no_audio, output_path)
-                return output_path
-        except FileNotFoundError:
-            print("[Inpainter] FFmpeg not found, output will have no audio")
+
+        ffmpeg_exe = self._ffmpeg_exe
+        if not ffmpeg_exe:
+            print("[Inpainter] FFmpeg not found (PATH/imageio-ffmpeg), output will have no audio")
             shutil.copy(video_no_audio, output_path)
             return output_path
-        
-        # FFmpeg command to mux audio from original into new video
-        # -c:v copy = copy video stream without re-encoding
-        # -c:a aac = encode audio as AAC for compatibility
-        # -map 0:v:0 = use video from first input (processed)
-        # -map 1:a:0? = use audio from second input (original) if it exists
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', video_no_audio,      # Input 1: processed video (no audio)
-            '-i', original_video,       # Input 2: original video (has audio)
-            '-c:v', 'copy',             # Copy video stream
-            '-c:a', 'aac',              # Encode audio as AAC
-            '-b:a', '192k',             # Audio bitrate
-            '-map', '0:v:0',            # Video from first input
-            '-map', '1:a:0?',           # Audio from second input (optional)
-            '-shortest',                # Match shortest stream
+
+        # Try 1: Stream-copy audio (zero quality loss)
+        cmd_copy = [
+            ffmpeg_exe, '-y',
+            '-i', video_no_audio,
+            '-i', original_video,
+            '-c:v', 'copy',
+            '-c:a', 'copy',            # Stream-copy audio (no re-encoding)
+            '-map', '0:v:0',
+            '-map', '1:a:0?',
+            '-shortest',
             output_path
         ]
-        
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            
+            result = subprocess.run(cmd_copy, capture_output=True, text=True, timeout=300)
+
             if result.returncode == 0 and Path(output_path).exists():
-                print(f"[Inpainter] Audio muxed successfully: {output_path}")
-                # Clean up the no-audio temp file
+                print(f"[Inpainter] Audio stream-copied successfully: {output_path}")
+                if Path(video_no_audio).exists() and video_no_audio != output_path:
+                    os.remove(video_no_audio)
+                return output_path
+            else:
+                print(f"[Inpainter] Audio stream-copy failed, retrying with AAC re-encode...")
+        except (subprocess.TimeoutExpired, Exception) as e:
+            print(f"[Inpainter] Audio stream-copy error: {e}, retrying with AAC re-encode...")
+
+        # Try 2: Re-encode audio as AAC (fallback for incompatible codecs)
+        cmd_aac = [
+            ffmpeg_exe, '-y',
+            '-i', video_no_audio,
+            '-i', original_video,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-map', '0:v:0',
+            '-map', '1:a:0?',
+            '-shortest',
+            output_path
+        ]
+
+        try:
+            result = subprocess.run(cmd_aac, capture_output=True, text=True, timeout=300)
+
+            if result.returncode == 0 and Path(output_path).exists():
+                print(f"[Inpainter] Audio muxed (AAC fallback) successfully: {output_path}")
                 if Path(video_no_audio).exists() and video_no_audio != output_path:
                     os.remove(video_no_audio)
                 return output_path
             else:
                 print(f"[Inpainter] FFmpeg muxing failed: {result.stderr[:500]}")
-                # Fall back to video without audio
                 shutil.copy(video_no_audio, output_path)
                 return output_path
-                
+
         except subprocess.TimeoutExpired:
             print("[Inpainter] FFmpeg muxing timed out")
             shutil.copy(video_no_audio, output_path)
@@ -152,6 +454,8 @@ class VideoInpainter:
         masks: Dict[int, np.ndarray],
         output_path: str,
         method: str = 'auto',
+        quality_mode: str = 'balanced',
+        detail_restore_mode: str = 'off',
         progress_callback: Callable = None
     ) -> str:
         """
@@ -162,6 +466,8 @@ class VideoInpainter:
             masks: Dict mapping frame_index -> binary mask (255 = inpaint)
             output_path: Output video path
             method: 'propainter', 'opencv', or 'auto'
+            quality_mode: 'balanced', 'rtx5090', 'rtx5090_crisp', or 'auto'
+            detail_restore_mode: 'off', 'roi_sharpen', or 'roi_sharpen_strong'
             progress_callback: Called with (current, total, message)
             
         Returns:
@@ -176,9 +482,65 @@ class VideoInpainter:
             if not self.propainter_available:
                 print("[Inpainter] ProPainter not available, falling back to OpenCV")
                 return self._inpaint_opencv(video_path, masks, output_path, progress_callback)
-            return self._inpaint_propainter(video_path, masks, output_path, progress_callback)
+            return self._inpaint_propainter(
+                video_path,
+                masks,
+                output_path,
+                quality_mode,
+                detail_restore_mode,
+                progress_callback
+            )
         else:
             return self._inpaint_opencv(video_path, masks, output_path, progress_callback)
+
+    def _apply_roi_detail_restore(
+        self,
+        original_frame: np.ndarray,
+        inpainted_frame: np.ndarray,
+        mask: np.ndarray,
+        mode: str
+    ) -> np.ndarray:
+        """Restore texture detail only inside/around inpainted ROI."""
+        if mode == 'off' or mask is None or not np.any(mask):
+            return inpainted_frame
+
+        if mode == 'roi_sharpen_strong':
+            amount = 1.25
+            sigma = 1.4
+            radius = 9
+        else:
+            amount = 0.85
+            sigma = 1.1
+            radius = 7
+
+        # Build a soft ROI blend mask from the binary inpaint mask.
+        roi = (mask > 127).astype(np.uint8) * 255
+        roi = cv2.dilate(roi, np.ones((3, 3), np.uint8), iterations=1)
+        roi_soft = cv2.GaussianBlur(roi.astype(np.float32) / 255.0, (radius, radius), sigma)
+        roi_soft = np.clip(roi_soft, 0.0, 1.0)
+        roi_soft_3 = np.repeat(roi_soft[:, :, None], 3, axis=2)
+
+        # Unsharp only on ProPainter output, then blend back into output in ROI.
+        blur = cv2.GaussianBlur(inpainted_frame, (0, 0), sigma)
+        sharp = cv2.addWeighted(inpainted_frame, 1.0 + amount, blur, -amount, 0.0)
+        sharp = np.clip(sharp, 0, 255).astype(np.uint8)
+
+        out = (
+            (1.0 - roi_soft_3) * inpainted_frame.astype(np.float32)
+            + roi_soft_3 * sharp.astype(np.float32)
+        )
+
+        # Keep transition slightly anchored to the original frame to avoid halos.
+        edge_band = cv2.Canny(roi, 30, 90)
+        if np.any(edge_band):
+            edge = cv2.GaussianBlur(edge_band.astype(np.float32) / 255.0, (9, 9), 2.0)
+            edge3 = np.repeat(edge[:, :, None], 3, axis=2) * 0.15
+            out = (
+                (1.0 - edge3) * out
+                + edge3 * original_frame.astype(np.float32)
+            )
+
+        return np.clip(out, 0, 255).astype(np.uint8)
     
     def _inpaint_opencv(
         self,
@@ -199,33 +561,33 @@ class VideoInpainter:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
+
+        # Stream frames directly to encoder — no RAM accumulation
+        writer = self._open_video_writer(output_path, fps, width, height, source_video_path=video_path)
         frame_idx = 0
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            mask = masks.get(frame_idx)
-            
-            if mask is not None and np.any(mask):
-                inpainted = self._seamless_inpaint(frame, mask)
-                out.write(inpainted)
-            else:
-                out.write(frame)
-            
-            if progress_callback:
-                progress_callback(frame_idx + 1, total_frames, "Inpainting (OpenCV)")
-            
-            frame_idx += 1
-        
+
+        try:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                mask = masks.get(frame_idx)
+
+                if mask is not None and np.any(mask):
+                    writer.write_frame(self._seamless_inpaint(frame, mask))
+                else:
+                    writer.write_frame(frame)
+
+                if progress_callback:
+                    progress_callback(frame_idx + 1, total_frames, "Inpainting (OpenCV)")
+
+                frame_idx += 1
+        finally:
+            writer.close()
+
         cap.release()
-        out.release()
-        
+
         return output_path
     
     def _seamless_inpaint(self, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -289,6 +651,8 @@ class VideoInpainter:
         video_path: str,
         masks: Dict[int, np.ndarray],
         output_path: str,
+        quality_mode: str = 'balanced',
+        detail_restore_mode: str = 'off',
         progress_callback: Callable = None
     ) -> str:
         """
@@ -300,10 +664,19 @@ class VideoInpainter:
         - Preserve temporal consistency via overlapping blends
         """
         print("[Inpainter] Using ProPainter with chunked processing (full quality)")
-        
-        # Chunking parameters - tuned for RTX 4080 (16GB)
-        CHUNK_SIZE = 40       # Frames per chunk
-        OVERLAP = 10          # Overlap between chunks for blending
+        print(f"[Inpainter] Detail restore mode: {detail_restore_mode}")
+        profile = self._quality_profile(quality_mode)
+
+        chunk_size = profile["chunk_size"]
+        overlap = profile["overlap"]
+        neighbor_length = profile["neighbor_length"]
+        ref_stride = profile["ref_stride"]
+        raft_iter = profile["raft_iter"]
+        mask_dilation = profile["mask_dilation"]
+        subvideo_length = profile["subvideo_length"]
+        use_fp16 = profile["use_fp16"]
+
+        print(f"[Inpainter] Quality profile: {profile['name']}")
         
         # Create temp directory
         temp_dir = Path(tempfile.mkdtemp(prefix="waterslayer_"))
@@ -320,14 +693,30 @@ class VideoInpainter:
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
             print(f"[Inpainter] Video: {width}x{height}, {total_frames} frames, {fps} fps")
-            print(f"[Inpainter] Chunk size: {CHUNK_SIZE}, Overlap: {OVERLAP}")
+            # Resolution-aware tuning:
+            # keep ProPainter default temporal settings for <= 720p-ish inputs.
+            # only trim very high resolutions where memory spikes are common.
+            megapixels = (width * height) / 1_000_000.0
+            if self._resolve_quality_mode(quality_mode) == "rtx5090" and megapixels >= 1.6:
+                chunk_size = min(chunk_size, 56)
+                overlap = min(overlap, 10)
+                neighbor_length = min(neighbor_length, 10)
+                ref_stride = max(ref_stride, 10)
+                raft_iter = min(raft_iter, 20)
+                subvideo_length = min(subvideo_length, 48)
+
+            print(
+                f"[Inpainter] Chunk size: {chunk_size}, Overlap: {overlap}, "
+                f"neighbor={neighbor_length}, ref_stride={ref_stride}, "
+                f"raft_iter={raft_iter}, subvideo={subvideo_length}, fp16={use_fp16}"
+            )
             
             # Calculate number of chunks
-            if total_frames <= CHUNK_SIZE:
+            if total_frames <= chunk_size:
                 num_chunks = 1
             else:
-                effective_chunk = CHUNK_SIZE - OVERLAP
-                num_chunks = max(1, (total_frames - OVERLAP + effective_chunk - 1) // effective_chunk)
+                effective_chunk = chunk_size - overlap
+                num_chunks = max(1, (total_frames - overlap + effective_chunk - 1) // effective_chunk)
             
             print(f"[Inpainter] Processing in {num_chunks} chunk(s)")
             
@@ -359,8 +748,8 @@ class VideoInpainter:
             
             for chunk_idx in range(num_chunks):
                 # Calculate chunk boundaries
-                start_frame = chunk_idx * (CHUNK_SIZE - OVERLAP)
-                end_frame = min(start_frame + CHUNK_SIZE, total_frames)
+                start_frame = chunk_idx * (chunk_size - overlap)
+                end_frame = min(start_frame + chunk_size, total_frames)
                 chunk_frames = list(range(start_frame, end_frame))
                 
                 print(f"[Inpainter] Processing chunk {chunk_idx + 1}/{num_chunks}: frames {start_frame}-{end_frame-1}")
@@ -388,14 +777,78 @@ class VideoInpainter:
                     cv2.imwrite(str(mask_path), all_masks[global_idx])
                 
                 # Run ProPainter on this chunk
-                self._run_propainter_chunk(
-                    chunk_frames_dir, 
-                    chunk_masks_dir, 
-                    chunk_output_dir,
-                    width, 
-                    height,
-                    len(chunk_frames)
-                )
+                try:
+                    self._run_propainter_chunk(
+                        chunk_frames_dir, 
+                        chunk_masks_dir, 
+                        chunk_output_dir,
+                        width, 
+                        height,
+                        len(chunk_frames),
+                        fps=fps,
+                        neighbor_length=neighbor_length,
+                        ref_stride=ref_stride,
+                        raft_iter=raft_iter,
+                        mask_dilation=mask_dilation,
+                        subvideo_length=min(len(chunk_frames), subvideo_length),
+                        use_fp16=use_fp16
+                    )
+                except RuntimeError as e:
+                    # Retry this chunk with safer memory settings instead of hard-failing.
+                    if not self._is_memory_error(str(e)):
+                        raise
+
+                    retry_neighbor = max(6, neighbor_length - 2)
+                    retry_ref_stride = max(12, ref_stride + 2)
+                    retry_raft_iter = max(12, raft_iter - 4)
+                    retry_subvideo = max(24, min(len(chunk_frames), subvideo_length - 16))
+                    print(
+                        f"[Inpainter] OOM on chunk {chunk_idx + 1}; retrying with safer settings "
+                        f"(neighbor={retry_neighbor}, ref_stride={retry_ref_stride}, "
+                        f"raft_iter={retry_raft_iter}, subvideo={retry_subvideo}, fp16=True)"
+                    )
+
+                    try:
+                        self._run_propainter_chunk(
+                            chunk_frames_dir, 
+                            chunk_masks_dir, 
+                            chunk_output_dir,
+                            width, 
+                            height,
+                            len(chunk_frames),
+                            fps=fps,
+                            neighbor_length=retry_neighbor,
+                            ref_stride=retry_ref_stride,
+                            raft_iter=retry_raft_iter,
+                            mask_dilation=mask_dilation,
+                            subvideo_length=retry_subvideo,
+                            use_fp16=True
+                        )
+                    except RuntimeError as e2:
+                        if not self._is_memory_error(str(e2)):
+                            raise
+                        # Last-chance retry for fragile cuDNN host-allocation failures:
+                        # slightly lower internal processing size only for this chunk.
+                        print(
+                            f"[Inpainter] Memory pressure persists on chunk {chunk_idx + 1}; "
+                            f"retrying with resize_ratio=0.9 fallback"
+                        )
+                        self._run_propainter_chunk(
+                            chunk_frames_dir,
+                            chunk_masks_dir,
+                            chunk_output_dir,
+                            width,
+                            height,
+                            len(chunk_frames),
+                            fps=fps,
+                            neighbor_length=max(6, retry_neighbor - 1),
+                            ref_stride=max(12, retry_ref_stride),
+                            raft_iter=max(10, retry_raft_iter - 2),
+                            mask_dilation=max(2, mask_dilation - 1),
+                            subvideo_length=max(20, min(len(chunk_frames), retry_subvideo - 8)),
+                            use_fp16=True,
+                            resize_ratio=0.9
+                        )
                 
                 # ProPainter saves to output/video_name/inpaint_out.mp4
                 # The video_name is the name of the frames directory (e.g., "frames")
@@ -445,7 +898,7 @@ class VideoInpainter:
                             if all_result_frames[global_idx] is not None:
                                 # This frame is in overlap zone - blend with previous chunk
                                 overlap_position = local_idx  # How far into current chunk
-                                blend_alpha = overlap_position / OVERLAP
+                                blend_alpha = overlap_position / overlap
                                 
                                 prev_frame = all_result_frames[global_idx]
                                 blended = cv2.addWeighted(
@@ -468,23 +921,36 @@ class VideoInpainter:
                 # Clean up chunk temp files
                 shutil.rmtree(chunk_dir, ignore_errors=True)
             
-            # Assemble final video (without audio first)
+            # Assemble final video — stream frames to encoder and free RAM as we go
             if progress_callback:
-                progress_callback(92, 100, "Assembling final video...")
-            
-            # Write to temp file first, then mux audio
+                progress_callback(92, 100, "Encoding final video...")
+
             temp_video_path = str(temp_dir / "output_no_audio.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
-            
-            for idx, frame in enumerate(all_result_frames):
-                if frame is not None:
-                    out.write(frame)
-                else:
-                    # Fallback to original if processing failed
-                    out.write(all_frames[idx])
-            
-            out.release()
+            writer = self._open_video_writer(temp_video_path, fps, width, height, source_video_path=video_path)
+
+            try:
+                for idx in range(total_frames):
+                    # Pick result frame or fall back to original
+                    frame = all_result_frames[idx] if all_result_frames[idx] is not None else all_frames[idx]
+
+                    # Optional detail restore
+                    if detail_restore_mode != 'off' and all_result_frames[idx] is not None:
+                        frame = self._apply_roi_detail_restore(
+                            all_frames[idx], frame, all_masks[idx], detail_restore_mode
+                        )
+
+                    writer.write_frame(frame)
+
+                    # Free memory — frame already written to encoder
+                    all_result_frames[idx] = None
+                    all_frames[idx] = None
+                    all_masks[idx] = None
+
+                    if progress_callback and idx % 100 == 0:
+                        encode_pct = 92 + int((idx / total_frames) * 4)
+                        progress_callback(encode_pct, 100, f"Encoding frame {idx}/{total_frames}")
+            finally:
+                writer.close()
             
             # Mux audio from original video
             if progress_callback:
@@ -508,7 +974,15 @@ class VideoInpainter:
         output_dir: Path,
         width: int,
         height: int,
-        num_frames: int
+        num_frames: int,
+        fps: float,
+        neighbor_length: int,
+        ref_stride: int,
+        raft_iter: int,
+        mask_dilation: int,
+        subvideo_length: int,
+        use_fp16: bool,
+        resize_ratio: float = 1.0
     ):
         """Run ProPainter on a single chunk at FULL resolution."""
         propainter_dir = Path(self.propainter_path)
@@ -527,23 +1001,27 @@ class VideoInpainter:
             "--mask", str(masks_dir),
             "--output", str(output_dir),
             # Full resolution settings
-            "--resize_ratio", "1.0",
+            "--resize_ratio", str(resize_ratio),
             "--height", str(height),
             "--width", str(width),
             # Temporal parameters for quality
-            "--neighbor_length", "10",  # Full temporal window for quality
-            "--ref_stride", "10",
-            "--subvideo_length", str(num_frames),  # Process entire chunk as one
-            "--save_fps", "30",
-            "--fp16"  # FP16 saves memory without quality loss
+            "--neighbor_length", str(neighbor_length),
+            "--ref_stride", str(ref_stride),
+            "--raft_iter", str(raft_iter),
+            "--mask_dilation", str(mask_dilation),
+            "--subvideo_length", str(subvideo_length),
+            "--save_fps", str(max(1, int(round(fps))))
         ]
+
+        if use_fp16:
+            cmd.append("--fp16")
         
         print(f"[Inpainter] Running ProPainter with memory optimizations...")
         print(f"[Inpainter] Command: {' '.join(cmd)}")
         
         # Set environment variable for better memory management
         env = os.environ.copy()
-        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
         
         result = subprocess.run(
             cmd,
@@ -556,7 +1034,7 @@ class VideoInpainter:
         if result.returncode != 0:
             print(f"[Inpainter] ProPainter stderr: {result.stderr}")
             # If OOM, provide helpful message
-            if "OutOfMemoryError" in result.stderr or "out of memory" in result.stderr.lower():
+            if self._is_memory_error(result.stderr):
                 raise RuntimeError(
                     f"CUDA Out of Memory on chunk! Chunk size may need to be reduced. "
                     f"Current: {num_frames} frames at {width}x{height}"
@@ -577,20 +1055,21 @@ class VideoInpainter:
             raise ValueError(f"No frames found in {frames_dir}")
         
         print(f"[Inpainter] Assembling {len(frame_files)} frames at {fps} fps")
-        
+
         # Read first frame for dimensions
         first_frame = cv2.imread(str(frame_files[0]))
         height, width = first_frame.shape[:2]
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        for frame_file in frame_files:
-            frame = cv2.imread(str(frame_file))
-            if frame is not None:
-                out.write(frame)
-        
-        out.release()
+
+        # Stream frames directly to encoder — no RAM accumulation
+        writer = self._open_video_writer(output_path, fps, width, height)
+        try:
+            writer.write_frame(first_frame)
+            for frame_file in frame_files[1:]:
+                frame = cv2.imread(str(frame_file))
+                if frame is not None:
+                    writer.write_frame(frame)
+        finally:
+            writer.close()
         print(f"[Inpainter] Video saved to {output_path}")
 
 
@@ -623,29 +1102,76 @@ class SimpleInpainter:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
+
+        processed_frames = []
         frame_idx = 0
-        
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            
+
             mask = masks.get(frame_idx)
             if mask is not None and np.any(mask):
                 frame = SimpleInpainter.inpaint_frame(frame, mask)
-            
-            out.write(frame)
-            
+
+            processed_frames.append(frame)
+
             if progress_callback and frame_idx % 10 == 0:
                 progress_callback(frame_idx + 1, total_frames, "Quick inpaint")
-            
+
             frame_idx += 1
-        
+
         cap.release()
+
+        # Use FFmpeg for quality-preserving encoding if available
+        ffmpeg_exe = VideoInpainter._resolve_ffmpeg_exe()
+        if ffmpeg_exe:
+            # Probe input bitrate
+            input_bitrate = None
+            ffprobe_exe = VideoInpainter._resolve_ffprobe_exe()
+            if ffprobe_exe:
+                try:
+                    cmd = [ffprobe_exe, '-v', 'quiet', '-select_streams', 'v:0',
+                           '-show_entries', 'stream=bit_rate', '-of', 'csv=p=0', video_path]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    if result.returncode == 0 and result.stdout.strip():
+                        val = result.stdout.strip().split('\n')[0].strip()
+                        if val and val != 'N/A':
+                            input_bitrate = int(val)
+                except Exception:
+                    pass
+
+            cmd = [
+                ffmpeg_exe, '-y',
+                '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                '-s', f'{width}x{height}', '-pix_fmt', 'bgr24',
+                '-r', str(fps), '-i', '-',
+                '-c:v', 'libx264', '-preset', 'medium', '-pix_fmt', 'yuv420p',
+            ]
+            if input_bitrate:
+                cmd += ['-b:v', str(input_bitrate)]
+            else:
+                cmd += ['-crf', '16']
+            cmd.append(output_path)
+
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            for frame in processed_frames:
+                try:
+                    proc.stdin.write(frame.tobytes())
+                except BrokenPipeError:
+                    break
+            proc.stdin.close()
+            proc.wait()
+
+            if proc.returncode == 0:
+                return output_path
+
+        # Fallback to OpenCV VideoWriter
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        for frame in processed_frames:
+            out.write(frame)
         out.release()
-        
+
         return output_path

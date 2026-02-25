@@ -1,14 +1,13 @@
 # WaterSlayer Data
-
-# Ignore everything in data directories except .gitkeep
-/input/*
-!/input/.gitkeep
-/output/*
-!/output/.gitkeep
-/models/*
-!/models/.gitkeep
-/temp/*
-!/temp/.gitkeep
+# Ignore generated media under data/
+/data/input/*
+!/data/input/.gitkeep
+/data/output/*
+!/data/output/.gitkeep
+/data/models/*
+!/data/models/.gitkeep
+/data/temp/*
+!/data/temp/.gitkeep
 
 # Python
 __pycache__/

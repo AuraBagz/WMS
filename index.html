@@ -161,10 +161,18 @@
                     </div>
                     <div class="card-body">
                         <div class="form-group">
-                            <label class="form-label">Detection Confidence</label>
+                            <label class="form-label">High Confidence Threshold</label>
                             <div class="slider-container">
                                 <input type="range" id="conf-slider" min="10" max="95" value="50" class="slider">
                                 <span id="conf-display" class="slider-value">50%</span>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Low Confidence Threshold</label>
+                            <div class="slider-container">
+                                <input type="range" id="low-conf-slider" min="5" max="80" value="20" class="slider">
+                                <span id="low-conf-display" class="slider-value">20%</span>
                             </div>
                         </div>
 
@@ -175,6 +183,69 @@
                                 <option value="opencv">OpenCV (Fast)</option>
                                 <option value="propainter">ProPainter (Quality)</option>
                             </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Detection Mode</label>
+                            <select id="detection-mode-select" class="select">
+                                <option value="strict_parity">Strict Parity (AnnoStudio)</option>
+                                <option value="standard">Standard (Smoothed)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Quality Profile</label>
+                            <select id="quality-select" class="select">
+                                <option value="auto">Auto (Detect GPU)</option>
+                                <option value="balanced">Balanced</option>
+                                <option value="rtx5090">RTX 5090 (Maximum Quality)</option>
+                                <option value="rtx5090_crisp">RTX 5090 (Crisp Removal)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Detail Restore Pass</label>
+                            <select id="detail-restore-select" class="select">
+                                <option value="off">Off</option>
+                                <option value="roi_sharpen">ROI Sharpen (Recommended)</option>
+                                <option value="roi_sharpen_strong">ROI Sharpen (Strong)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Detection Source -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
+                                stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                            </svg>
+                            Detection Source
+                        </h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="toggle-group">
+                            <button class="toggle-btn active" id="toggle-yolo" data-mode="yolo">YOLO Model</button>
+                            <button class="toggle-btn" id="toggle-manual" data-mode="manual">Manual Box</button>
+                        </div>
+
+                        <!-- Manual box controls (hidden by default) -->
+                        <div id="manual-box-section" class="hidden" style="margin-top: 12px;">
+                            <button class="btn btn-primary w-full" id="open-box-modal-btn">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
+                                    stroke="currentColor" width="16" height="16">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                                </svg>
+                                Select Region to Remove
+                            </button>
+                            <div id="box-coords" class="box-coords hidden">
+                                <span id="box-coords-text"></span>
+                                <button class="btn btn-ghost btn-sm" id="clear-box-btn">Clear</button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -329,6 +400,32 @@
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
         </svg>
         <span id="toast-message">Success!</span>
+    </div>
+
+    <!-- Manual Box Modal -->
+    <div class="modal-overlay hidden" id="box-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Select Region to Remove</h2>
+                <div class="modal-header-actions">
+                    <button class="btn btn-ghost btn-sm" id="modal-cancel-btn">Cancel</button>
+                    <button class="btn btn-primary btn-sm" id="modal-confirm-btn" disabled>Confirm Selection</button>
+                </div>
+            </div>
+            <div class="modal-body">
+                <div class="modal-canvas-wrap" id="modal-canvas-wrap">
+                    <canvas id="box-canvas"></canvas>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div class="frame-scrubber">
+                    <label class="form-label" style="margin: 0; font-size: 0.8rem;">Frame</label>
+                    <input type="range" id="frame-scrubber" min="0" max="100" value="0" class="slider" style="flex: 1;">
+                    <span id="frame-number" class="slider-value" style="min-width: 60px; text-align: right;">0 / 0</span>
+                </div>
+                <p class="help-text" style="margin-top: 6px;">Click and drag to draw a box. Scrub the slider to check different frames.</p>
+            </div>
+        </div>
     </div>
 
     <script src="app.js"></script>
