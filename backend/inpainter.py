@@ -338,6 +338,23 @@ class VideoInpainter:
             "cuda error: out of memory",
         ]
         return any(p in text for p in patterns)
+
+    def _is_propainter_capacity_error(self, message: str) -> bool:
+        """
+        Detect ProPainter/RAFT failures caused by tensor size/capacity limits.
+        These should trigger safer retry settings instead of hard-failing.
+        """
+        text = (message or "").lower()
+        if self._is_memory_error(text):
+            return True
+        patterns = [
+            "integer out of range",
+            "cudnn_status_not_supported",
+            "cublas_status_not_supported",
+            "cuda error: invalid configuration argument",
+            "resource exhausted",
+        ]
+        return any(p in text for p in patterns)
     
     def _check_propainter(self) -> bool:
         """Check if ProPainter is available."""
@@ -795,8 +812,8 @@ class VideoInpainter:
                         use_fp16=use_fp16
                     )
                 except RuntimeError as e:
-                    # Retry this chunk with safer memory settings instead of hard-failing.
-                    if not self._is_memory_error(str(e)):
+                    # Retry this chunk with safer settings instead of hard-failing.
+                    if not self._is_propainter_capacity_error(str(e)):
                         raise
 
                     retry_neighbor = max(6, neighbor_length - 2)
@@ -826,30 +843,60 @@ class VideoInpainter:
                             use_fp16=True
                         )
                     except RuntimeError as e2:
-                        if not self._is_memory_error(str(e2)):
+                        if not self._is_propainter_capacity_error(str(e2)):
                             raise
-                        # Last-chance retry for fragile cuDNN host-allocation failures:
-                        # slightly lower internal processing size only for this chunk.
+                        # Last-chance retry: lower internal processing size for this chunk.
+                        # For 4K this typically lands near ~1080p internal processing.
+                        target_pixels = 1920 * 1080
+                        frame_pixels = max(1, width * height)
+                        dynamic_ratio = (target_pixels / float(frame_pixels)) ** 0.5
+                        safe_ratio = min(0.9, max(0.45, dynamic_ratio))
                         print(
                             f"[Inpainter] Memory pressure persists on chunk {chunk_idx + 1}; "
-                            f"retrying with resize_ratio=0.9 fallback"
+                            f"retrying with resize_ratio={safe_ratio:.2f} fallback"
                         )
-                        self._run_propainter_chunk(
-                            chunk_frames_dir,
-                            chunk_masks_dir,
-                            chunk_output_dir,
-                            width,
-                            height,
-                            len(chunk_frames),
-                            fps=fps,
-                            neighbor_length=max(6, retry_neighbor - 1),
-                            ref_stride=max(12, retry_ref_stride),
-                            raft_iter=max(10, retry_raft_iter - 2),
-                            mask_dilation=max(2, mask_dilation - 1),
-                            subvideo_length=max(20, min(len(chunk_frames), retry_subvideo - 8)),
-                            use_fp16=True,
-                            resize_ratio=0.9
-                        )
+                        try:
+                            self._run_propainter_chunk(
+                                chunk_frames_dir,
+                                chunk_masks_dir,
+                                chunk_output_dir,
+                                width,
+                                height,
+                                len(chunk_frames),
+                                fps=fps,
+                                neighbor_length=max(6, retry_neighbor - 1),
+                                ref_stride=max(12, retry_ref_stride),
+                                raft_iter=max(10, retry_raft_iter - 2),
+                                mask_dilation=max(2, mask_dilation - 1),
+                                subvideo_length=max(20, min(len(chunk_frames), retry_subvideo - 8)),
+                                use_fp16=True,
+                                resize_ratio=safe_ratio
+                            )
+                        except RuntimeError as e3:
+                            if not self._is_propainter_capacity_error(str(e3)):
+                                raise
+                            # Final fallback for pathological clips/resolutions.
+                            final_ratio = max(0.40, safe_ratio * 0.85)
+                            print(
+                                f"[Inpainter] Capacity error persists on chunk {chunk_idx + 1}; "
+                                f"final retry with resize_ratio={final_ratio:.2f}"
+                            )
+                            self._run_propainter_chunk(
+                                chunk_frames_dir,
+                                chunk_masks_dir,
+                                chunk_output_dir,
+                                width,
+                                height,
+                                len(chunk_frames),
+                                fps=fps,
+                                neighbor_length=max(6, retry_neighbor - 2),
+                                ref_stride=max(14, retry_ref_stride + 2),
+                                raft_iter=max(8, retry_raft_iter - 4),
+                                mask_dilation=max(2, mask_dilation - 2),
+                                subvideo_length=max(16, min(len(chunk_frames), retry_subvideo - 12)),
+                                use_fp16=True,
+                                resize_ratio=final_ratio
+                            )
                 
                 # ProPainter saves to output/video_name/inpaint_out.mp4
                 # The video_name is the name of the frames directory (e.g., "frames")
